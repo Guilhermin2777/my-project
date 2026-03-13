@@ -12,12 +12,14 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
 
+TOKEN = os.getenv("DISCORD_TOKEN")
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
 SPOTIFY_TRACK_REGEX = re.compile(
     r"(?:https?://open\.spotify\.com/(?:intl-[^/]+/)?track/|spotify:track:)([A-Za-z0-9]+)"
 )
@@ -30,21 +32,53 @@ _SPOTIFY_TOKEN_CACHE = {
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "noplaylist": False,
-    "default_search": "ytsearch",
-    "quiet": True,
-    "nocheckcertificate": True,
-    "source_address": "0.0.0.0",
-}
+
+def resolve_cookie_file():
+    env_cookie_file = os.getenv("YTDLP_COOKIEFILE")
+    env_cookies_b64 = os.getenv("YTDLP_COOKIES_B64")
+
+    if env_cookies_b64:
+        try:
+            decoded = base64.b64decode(env_cookies_b64).decode("utf-8")
+            runtime_cookie_path = "runtime_cookies.txt"
+            with open(runtime_cookie_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(decoded)
+            return runtime_cookie_path
+        except Exception as e:
+            print(f"Erro ao decodificar YTDLP_COOKIES_B64: {e}")
+
+    if env_cookie_file and os.path.exists(env_cookie_file):
+        return env_cookie_file
+
+    if os.path.exists("cookies.txt"):
+        return "cookies.txt"
+
+    return None
+
+
+def build_ytdl_options():
+    options = {
+        "format": "bestaudio/best",
+        "noplaylist": False,
+        "default_search": "ytsearch",
+        "quiet": True,
+        "nocheckcertificate": True,
+        "source_address": "0.0.0.0",
+    }
+
+    cookie_file = resolve_cookie_file()
+    if cookie_file:
+        options["cookiefile"] = cookie_file
+
+    return options
+
 
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
-ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+ytdl = yt_dlp.YoutubeDL(build_ytdl_options())
 
 
 class GuildPlayer:
@@ -224,6 +258,19 @@ def get_spotify_track(track_id: str):
     }
 
 
+def humanize_ytdlp_error(error: Exception):
+    message = str(error)
+
+    if "Sign in to confirm you're not a bot" in message:
+        return (
+            "O YouTube bloqueou essa busca. "
+            "Adicione cookies válidos do YouTube no Railway usando a variável "
+            "`YTDLP_COOKIES_B64` ou use um `cookies.txt` válido."
+        )
+
+    return message
+
+
 async def extract_track(query: str):
     spotify_track_id = extract_spotify_track_id(query)
 
@@ -231,8 +278,35 @@ async def extract_track(query: str):
         loop = asyncio.get_running_loop()
 
         def _spotify_extract():
-            spotify_data = get_spotify_track(spotify_track_id)
-            data = ytdl.extract_info(spotify_data["search_query"], download=False)
+            try:
+                spotify_data = get_spotify_track(spotify_track_id)
+                data = ytdl.extract_info(spotify_data["search_query"], download=False)
+
+                if "entries" in data:
+                    entries = [e for e in data["entries"] if e]
+                    if not entries:
+                        return None
+                    data = entries[0]
+
+                return {
+                    "title": spotify_data["title"],
+                    "artist": spotify_data["artist"],
+                    "stream_url": data["url"],
+                    "webpage_url": spotify_data["webpage_url"],
+                    "duration": spotify_data["duration"],
+                    "thumbnail": spotify_data["thumbnail"] or data.get("thumbnail"),
+                    "source": "spotify",
+                }
+            except DownloadError as e:
+                raise RuntimeError(humanize_ytdlp_error(e))
+
+        return await loop.run_in_executor(None, _spotify_extract)
+
+    loop = asyncio.get_running_loop()
+
+    def _extract():
+        try:
+            data = ytdl.extract_info(query, download=False)
 
             if "entries" in data:
                 entries = [e for e in data["entries"] if e]
@@ -241,36 +315,16 @@ async def extract_track(query: str):
                 data = entries[0]
 
             return {
-                "title": spotify_data["title"],
-                "artist": spotify_data["artist"],
+                "title": data.get("title", "Sem título"),
+                "artist": data.get("uploader") or data.get("channel") or "Desconhecido",
                 "stream_url": data["url"],
-                "webpage_url": spotify_data["webpage_url"],
-                "duration": spotify_data["duration"],
-                "thumbnail": spotify_data["thumbnail"] or data.get("thumbnail"),
-                "source": "spotify",
+                "webpage_url": data.get("webpage_url", query),
+                "duration": data.get("duration"),
+                "thumbnail": data.get("thumbnail"),
+                "source": "youtube",
             }
-
-        return await loop.run_in_executor(None, _spotify_extract)
-
-    loop = asyncio.get_running_loop()
-
-    def _extract():
-        data = ytdl.extract_info(query, download=False)
-        if "entries" in data:
-            entries = [e for e in data["entries"] if e]
-            if not entries:
-                return None
-            data = entries[0]
-
-        return {
-            "title": data.get("title", "Sem título"),
-            "artist": data.get("uploader") or data.get("channel") or "Desconhecido",
-            "stream_url": data["url"],
-            "webpage_url": data.get("webpage_url", query),
-            "duration": data.get("duration"),
-            "thumbnail": data.get("thumbnail"),
-            "source": "youtube",
-        }
+        except DownloadError as e:
+            raise RuntimeError(humanize_ytdlp_error(e))
 
     return await loop.run_in_executor(None, _extract)
 
